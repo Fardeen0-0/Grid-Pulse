@@ -1,0 +1,8 @@
+# AGENTS.md — GridPulse Engineering Rules
+
+1. **No Stubs or Fake Integrations:** Every sponsor service (Tiger Data, MongoDB Atlas, Google Gemini API, Solana Devnet) must execute real network calls using credentials from `.env`. Never hardcode fake responses for API endpoints.
+2. **Google Gemini SDK Standard:** Use the official `google-genai` Python SDK (`from google import genai; client = genai.Client()`)—never the deprecated `google-generativeai` package. Use `gemini-3.8-flash` (with automatic fallback to `gemini-2.5-flash` if needed) and Pydantic `response_schema` for structured JSON extraction from utility bill images.
+3. **Tiger Data (TimescaleDB) Standard:** Use `psycopg` (v3) with PostgreSQL hypertables (`create_hypertable`) and a real Continuous Aggregate (`CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous) AS SELECT time_bucket(...)`) plus `add_continuous_aggregate_policy()`.
+4. **MongoDB Atlas Standard:** Use `motor` (async MongoDB driver) to store user profiles, parsed utility bill JSON documents, and neighborhood/campus challenge leaderboards.
+5. **Solana Devnet Standard:** Use `solana` and `solders` (Python) to send real Devnet SOL micro-payout transactions upon verified peak-load reduction, returning the real transaction signature and Solscan Devnet URL (`https://solscan.io/tx/<sig>?cluster=devnet`). If `SOLANA_PRIVATE_KEY` is empty in `.env`, auto-generate a keypair on startup, save it to `.env`, and request a Devnet airdrop.
+6. **Self-Verification Required:** You are not finished until `python backend/verify_all.py` runs end-to-end and exits with code `0`.

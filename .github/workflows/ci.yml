@@ -1,0 +1,214 @@
+# CI for an early-stage repo whose stack is not settled yet.
+#
+# Produces a check run on every push to main (so an external auditor can be
+# notified) and on every pull request that targets main.
+#
+# The job always checks out the code and runs a sanity step, which is enough
+# for a README-only tree. When a known manifest appears at the repo root, the
+# matching block installs dependencies and runs lint/tests only if that project
+# defines them. Missing tests do not fail the job. A lint or test command that
+# exists and fails does fail the job.
+#
+# GitHub-hosted runners already provide Node.js, Python, Go, and Rust. To pin a
+# version, add actions/setup-node, actions/setup-python, or actions/setup-go
+# before the matching block. To support another tool (uv, poetry, pipenv), copy
+# one of the blocks in "Project checks" and gate it on that tool's manifest.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # Always runs. A repo with no application code still passes.
+      - name: Sanity check
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse --verify HEAD >/dev/null
+          echo "Checked out ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+          ls -la
+
+      # Each block no-ops when its manifest is absent. Checks look at the
+      # repository root; point a block at a subdirectory if the app lives there.
+      - name: Project checks
+        shell: bash
+        env:
+          # corepack would otherwise stop and wait for a download confirmation.
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          set -euo pipefail
+
+          # Node.js. The lockfile selects the installer. "lint" and "test" run
+          # only when package.json defines them. `npm init` writes a placeholder
+          # test script ("Error: no test specified") which counts as no tests.
+          if [[ -f package.json ]]; then
+            echo "::group::Node.js"
+            runner="npm"
+            if [[ -f pnpm-lock.yaml ]]; then
+              runner="pnpm"
+              corepack enable
+              corepack prepare pnpm@latest --activate
+              pnpm install --frozen-lockfile
+            elif [[ -f yarn.lock ]]; then
+              runner="yarn"
+              corepack enable
+              if grep -q 'yarn lockfile v1' yarn.lock; then
+                corepack prepare yarn@1.22.22 --activate
+                yarn install --frozen-lockfile
+              else
+                corepack prepare yarn@stable --activate
+                yarn install --immutable
+              fi
+            elif [[ -f package-lock.json ]]; then
+              npm ci
+            else
+              npm install
+            fi
+
+            run_npm_script() {
+              local name="$1"
+              local raw
+              raw="$(npm pkg get "scripts.${name}")"
+              # npm prints {} when the script key is absent, and "" when it is empty.
+              if [[ "$raw" == "undefined" || "$raw" == "{}" || "$raw" == '""' ]]; then
+                echo "No \"${name}\" script; skipping"
+                return 0
+              fi
+              if [[ "$name" == "test" && "$raw" == *"no test specified"* ]]; then
+                echo "npm test is still the generated placeholder; skipping"
+                return 0
+              fi
+              echo "Running ${runner} run ${name}"
+              "${runner}" run "${name}"
+            }
+
+            run_npm_script lint
+            run_npm_script test
+            echo "::endgroup::"
+          else
+            echo "No package.json; skipping Node.js"
+          fi
+
+          # Python. --user plus --break-system-packages works on Ubuntu's
+          # externally managed interpreter and does not need python3-venv.
+          # Ruff runs only when a Ruff config exists. Pytest runs when it is
+          # installed or a pytest config / tests directory is present. Pytest's
+          # exit code 5 means nothing was collected and is treated as success.
+          if [[ -f requirements.txt || -f pyproject.toml ]]; then
+            echo "::group::Python"
+            export PATH="${HOME}/.local/bin:${PATH}"
+            pip_install() {
+              python3 -m pip install --user --break-system-packages "$@"
+            }
+            pip_install --upgrade pip
+            if [[ -f requirements.txt ]]; then
+              pip_install -r requirements.txt
+            fi
+            # Poetry-only pyprojects (a [tool.poetry] table and no [project]
+            # table) are not installed. Add [project] or requirements.txt.
+            if [[ -f pyproject.toml ]] && grep -Eq '^\[project\]' pyproject.toml; then
+              pip_install .
+            fi
+
+            if [[ -f ruff.toml || -f .ruff.toml ]] || { [[ -f pyproject.toml ]] && grep -Eq '^\[tool\.ruff' pyproject.toml; }; then
+              if ! command -v ruff >/dev/null 2>&1; then
+                pip_install ruff
+              fi
+              ruff check .
+            else
+              echo "No Ruff config; skipping Python lint"
+            fi
+
+            wants_pytest=false
+            if python3 -c "import pytest" >/dev/null 2>&1; then
+              wants_pytest=true
+            elif [[ -f pytest.ini || -d tests || -d test ]]; then
+              wants_pytest=true
+            elif [[ -f pyproject.toml ]] && grep -Eq '^\[tool\.pytest' pyproject.toml; then
+              wants_pytest=true
+            else
+              shopt -s nullglob
+              py_tests=(test_*.py *_test.py)
+              if ((${#py_tests[@]} > 0)); then
+                wants_pytest=true
+              fi
+            fi
+
+            if [[ "$wants_pytest" == true ]]; then
+              if ! python3 -c "import pytest" >/dev/null 2>&1; then
+                pip_install pytest
+              fi
+              set +e
+              python3 -m pytest
+              code=$?
+              set -e
+              if [[ "$code" -eq 5 ]]; then
+                echo "No Python tests collected; continuing"
+              elif [[ "$code" -ne 0 ]]; then
+                exit "$code"
+              fi
+            else
+              echo "No pytest setup; skipping Python tests"
+            fi
+            echo "::endgroup::"
+          else
+            echo "No requirements.txt or pyproject.toml; skipping Python"
+          fi
+
+          # Go. A module with no packages yet (go.mod only) is success.
+          # `go test` exits 0 when packages have no test files. `go vet` is the
+          # built-in lint. For golangci-lint, run it only when .golangci.yml exists.
+          if [[ -f go.mod ]]; then
+            echo "::group::Go"
+            err_file="$(mktemp)"
+            set +e
+            packages="$(go list ./... 2>"$err_file")"
+            code=$?
+            set -e
+            if [[ "$code" -ne 0 ]]; then
+              cat "$err_file"
+              rm -f "$err_file"
+              exit "$code"
+            fi
+            rm -f "$err_file"
+            if [[ -z "$packages" ]]; then
+              echo "go.mod has no packages yet; skipping Go checks"
+            else
+              go test ./...
+              go vet ./...
+            fi
+            echo "::endgroup::"
+          else
+            echo "No go.mod; skipping Go"
+          fi
+
+          # Rust. `cargo test` exits 0 when the crate has no tests. Skip until
+          # src/ exists so a Cargo.toml-only scaffold does not fail.
+          if [[ -f Cargo.toml ]]; then
+            echo "::group::Rust"
+            if [[ -d src ]]; then
+              cargo test
+            else
+              echo "No src/ directory yet; skipping cargo test"
+            fi
+            echo "::endgroup::"
+          else
+            echo "No Cargo.toml; skipping Rust"
+          fi
+
+          echo "Project checks finished"
